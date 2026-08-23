@@ -75,3 +75,26 @@ def test_shadow_mode_logs_authorized_owner_without_relay() -> None:
     )
     assert len(repository.events) == 1
     assert driver.count == 0
+
+
+def test_database_failure_is_queued_and_returns_event() -> None:
+    class OfflineRepository(FakeRepository):
+        def find_owner(self, plate):
+            raise ConnectionError("offline")
+
+    class Outbox:
+        events = []
+
+        def enqueue(self, event, error):
+            self.events.append(event)
+
+    repository = OfflineRepository(access=True)
+    outbox = Outbox()
+    service = PassageService(
+        repository, RelayCoordinator(FakeRelay()), PassageDeduplicator(20), outbox=outbox,
+    )
+    result = service.process_detection(
+        plate_value="29d69112", direction=PassageDirection.ENTRY, camera_ip="In_L",
+    )
+    assert result is not None
+    assert len(outbox.events) == 1

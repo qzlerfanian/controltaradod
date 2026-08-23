@@ -11,6 +11,7 @@ from rahband.domain.deduplication import PassageDeduplicator
 from rahband.domain.relay import RelayCoordinator
 from rahband.repositories.sqlserver import SqlServerRepository
 from rahband.services.passage import PassageService
+from rahband.services.outbox import OutboxReplayer, SqlitePassageOutbox
 from rahband.anpr.health import CameraHealthRegistry
 from rahband.anpr.storage import ImageStore
 from rahband.anpr.worker import CameraSupervisor, CameraWorker
@@ -26,6 +27,8 @@ class AppRuntime:
     image_store: ImageStore
     camera_health: CameraHealthRegistry
     camera_supervisor: CameraSupervisor | None
+    outbox: SqlitePassageOutbox
+    outbox_replayer: OutboxReplayer | None
     camera_startup_error: str | None = None
 
     @classmethod
@@ -45,14 +48,19 @@ class AppRuntime:
         relay = RelayCoordinator(driver, settings.relay_hold_seconds)
         mqtt = MqttPublisher(settings.mqtt_host, settings.mqtt_port, settings.mqtt_topic, settings.site_id)
         image_store = ImageStore(settings.image_root)
+        outbox = SqlitePassageOutbox(settings.outbox_path)
         enabled_cameras = [camera for camera in settings.cameras if camera.enabled]
         camera_health = CameraHealthRegistry([camera.id for camera in enabled_cameras])
         passage_service = None
+        outbox_replayer = None
         if repository is not None:
             passage_service = PassageService(
-                repository, relay, PassageDeduplicator(settings.duplicate_window_seconds), mqtt,
+                repository, relay, PassageDeduplicator(settings.duplicate_window_seconds),
+                mqtt if settings.mqtt_enabled else None,
                 relay_enabled=not settings.shadow_mode,
+                outbox=outbox,
             )
+            outbox_replayer = OutboxReplayer(outbox, repository, settings.outbox_retry_seconds)
         supervisor = None
         startup_error = None
         if settings.camera_workers_enabled:
@@ -74,6 +82,8 @@ class AppRuntime:
                             vote_window_seconds=settings.vote_window_seconds,
                             vote_min_observations=settings.vote_min_observations,
                             reconnect_seconds=settings.camera_reconnect_seconds,
+                            open_timeout_ms=settings.camera_open_timeout_ms,
+                            read_timeout_ms=settings.camera_read_timeout_ms,
                         )
                         for camera in enabled_cameras
                     ]
@@ -83,5 +93,5 @@ class AppRuntime:
                     startup_error = str(error)
         return cls(
             settings, repository, relay, mqtt, passage_service, image_store,
-            camera_health, supervisor, startup_error,
+            camera_health, supervisor, outbox, outbox_replayer, startup_error,
         )

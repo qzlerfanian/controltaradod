@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from rahband.config import CameraSettings, Settings, get_settings
@@ -19,11 +21,12 @@ from rahband.runtime import AppRuntime
 class ServiceHealth(BaseModel):
     status: Literal["healthy", "degraded"]
     database: Literal["connected", "disconnected", "not_configured"]
-    mqtt: Literal["connected", "disconnected"]
+    mqtt: Literal["connected", "disconnected", "disabled"]
     relay: Literal["configured", "not_configured"]
     cameras_online: int
     cameras_total: int
     checked_at: datetime
+    queued_events: int = 0
 
 
 class CameraResponse(BaseModel):
@@ -34,6 +37,7 @@ class CameraResponse(BaseModel):
     relay_id: str
     enabled: bool
     online: bool = False
+    database_name: str | None = None
 
 
 class DetectionRequest(BaseModel):
@@ -100,15 +104,22 @@ async def lifespan(app: FastAPI):
     runtime = AppRuntime.build(settings)
     app.state.runtime = runtime
     try:
-        runtime.mqtt.start()
+        if settings.mqtt_enabled:
+            runtime.mqtt.start()
     except Exception:
         pass
     if runtime.camera_supervisor is not None:
         runtime.camera_supervisor.start()
+    if runtime.outbox_replayer is not None:
+        runtime.outbox_replayer.start()
     yield
+    if runtime.outbox_replayer is not None:
+        runtime.outbox_replayer.stop()
+        runtime.outbox_replayer.join(timeout=10)
     if runtime.camera_supervisor is not None:
         runtime.camera_supervisor.stop()
-    runtime.mqtt.stop()
+    if settings.mqtt_enabled:
+        runtime.mqtt.stop()
 
 
 app = FastAPI(title="Rahband API", version="0.2.0", lifespan=lifespan)
@@ -143,8 +154,14 @@ def health(current: Annotated[AppRuntime, Depends(runtime)]) -> ServiceHealth:
         except Exception:
             database = "disconnected"
     relay_configured = bool(current.settings.relay_host and current.settings.relay_password)
-    mqtt_state = "connected" if current.mqtt.connected else "disconnected"
-    healthy = database == "connected" and relay_configured and mqtt_state == "connected"
+    mqtt_state = (
+        "disabled" if not current.settings.mqtt_enabled
+        else "connected" if current.mqtt.connected
+        else "disconnected"
+    )
+    healthy = database == "connected" and relay_configured and (
+        not current.settings.mqtt_enabled or mqtt_state == "connected"
+    )
     cameras = current.settings.cameras
     camera_health = current.camera_health.snapshot()
     online_count = sum(1 for item in camera_health.values() if item["online"])
@@ -152,6 +169,7 @@ def health(current: Annotated[AppRuntime, Depends(runtime)]) -> ServiceHealth:
         status="healthy" if healthy else "degraded", database=database, mqtt=mqtt_state,
         relay="configured" if relay_configured else "not_configured", cameras_online=online_count,
         cameras_total=len([camera for camera in cameras if camera.enabled]), checked_at=datetime.now(timezone.utc),
+        queued_events=current.outbox.count(),
     )
 
 
@@ -172,6 +190,16 @@ def camera_health(current: Annotated[AppRuntime, Depends(runtime)]) -> dict[str,
     return current.camera_health.snapshot()
 
 
+@app.get("/api/v1/cameras/{camera_id}/snapshot", response_class=Response)
+def camera_snapshot(camera_id: str, current: Annotated[AppRuntime, Depends(runtime)]) -> Response:
+    if camera_id not in {camera.id for camera in current.settings.cameras if camera.enabled}:
+        raise HTTPException(status_code=404, detail="camera not found")
+    jpeg = current.camera_health.latest_preview(camera_id)
+    if jpeg is None:
+        raise HTTPException(status_code=503, detail="camera frame is not ready")
+    return Response(jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store, max-age=0"})
+
+
 @app.get("/api/v1/events")
 def events(current: Annotated[AppRuntime, Depends(runtime)], limit: Annotated[int, Query(ge=1, le=200)] = 20) -> list[dict[str, Any]]:
     if current.repository is None:
@@ -184,6 +212,81 @@ def events(current: Annotated[AppRuntime, Depends(runtime)], limit: Annotated[in
         return items
     except Exception as error:
         raise HTTPException(status_code=503, detail="database unavailable") from error
+
+
+def passage_filters(
+    date_from: date | None, date_to: date | None, direction: str | None,
+    access: str | None, camera: str | None, search: str | None,
+) -> dict[str, Any]:
+    return {
+        "date_from": datetime.combine(date_from, time.min) if date_from else None,
+        "date_to": datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None,
+        "direction": direction,
+        "access": True if access == "authorized" else False if access == "unauthorized" else None,
+        "camera": camera.strip() if camera else None,
+        "search": search.strip()[:100] if search and search.strip() else None,
+    }
+
+
+@app.get("/api/v1/passages")
+def passages(
+    current: Annotated[AppRuntime, Depends(runtime)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=10, le=100)] = 25,
+    date_from: date | None = None, date_to: date | None = None,
+    direction: Literal["entry", "exit"] | None = None,
+    access: Literal["authorized", "unauthorized"] | None = None,
+    camera: str | None = None, search: str | None = None,
+) -> dict[str, Any]:
+    if current.repository is None:
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "pages": 0}
+    try:
+        items, total = current.repository.paginated_events(
+            page=page, page_size=page_size,
+            **passage_filters(date_from, date_to, direction, access, camera, search),
+        )
+        for item in items:
+            item["plate_image_url"] = f"/api/v1/images/plate/{item['log_id']}"
+            item["vehicle_image_url"] = f"/api/v1/images/vehicle/{item['log_id']}"
+        return {
+            "items": items, "total": total, "page": page, "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size,
+        }
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="passages database unavailable") from error
+
+
+@app.get("/api/v1/passages/export")
+def export_passages(
+    current: Annotated[AppRuntime, Depends(runtime)],
+    date_from: date | None = None, date_to: date | None = None,
+    direction: Literal["entry", "exit"] | None = None,
+    access: Literal["authorized", "unauthorized"] | None = None,
+    camera: str | None = None, search: str | None = None,
+) -> Response:
+    if current.repository is None:
+        raise HTTPException(status_code=503, detail="database is not configured")
+    try:
+        items = current.repository.export_events(
+            **passage_filters(date_from, date_to, direction, access, camera, search),
+        )
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="export database unavailable") from error
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["زمان", "جهت", "پلاک", "مالک", "واحد", "مدل", "رنگ", "دوربین", "دسترسی"])
+    for item in items:
+        writer.writerow([
+            item["trans_time"].isoformat(sep=" "), "ورود" if item["direction"] == "entry" else "خروج",
+            item["plate_number"], item["full_name"] or "میهمان", item["unit"] or "",
+            item["model"] or "", item["color"] or "", item["camera_ip"] or "",
+            "مجاز" if item["access"] else "غیرمجاز",
+        ])
+    payload = ("\ufeff" + output.getvalue()).encode("utf-8")
+    return Response(
+        payload, media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="rahband-passages.csv"'},
+    )
 
 
 @app.get("/api/v1/owners")

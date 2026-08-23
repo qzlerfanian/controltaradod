@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from threading import Event, Thread
 
 from rahband.config import CameraSettings
@@ -25,6 +26,8 @@ class CameraWorker(Thread):
         vote_window_seconds: float,
         vote_min_observations: int,
         reconnect_seconds: float,
+        open_timeout_ms: int = 8000,
+        read_timeout_ms: int = 8000,
     ) -> None:
         super().__init__(name=f"camera-{camera.id}", daemon=True)
         self._camera = camera
@@ -34,6 +37,8 @@ class CameraWorker(Thread):
         self._health = health
         self._voter = TemporalPlateVoter(vote_window_seconds, vote_min_observations)
         self._reconnect_seconds = reconnect_seconds
+        self._open_timeout_ms = open_timeout_ms
+        self._read_timeout_ms = read_timeout_ms
         self._stop_event = Event()
         self._logger = logging.getLogger(f"rahband.camera.{camera.id}")
 
@@ -41,10 +46,14 @@ class CameraWorker(Thread):
         self._stop_event.set()
 
     def run(self) -> None:
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
         import cv2
 
         while not self._stop_event.is_set():
-            capture = cv2.VideoCapture(self._camera.rtsp_url.get_secret_value(), cv2.CAP_FFMPEG)
+            capture = cv2.VideoCapture()
+            capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, self._open_timeout_ms)
+            capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, self._read_timeout_ms)
+            capture.open(self._camera.rtsp_url.get_secret_value(), cv2.CAP_FFMPEG)
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not capture.isOpened():
                 self._health.disconnected(self._camera.id, "RTSP connection failed")
@@ -60,6 +69,14 @@ class CameraWorker(Thread):
                         raise ConnectionError("RTSP frame read failed")
                     self._health.frame(self._camera.id)
                     frame_number += 1
+                    if frame_number == 1 or frame_number % 15 == 0:
+                        preview_frame = frame
+                        if frame.shape[1] > 960:
+                            scale = 960 / frame.shape[1]
+                            preview_frame = cv2.resize(frame, (960, int(frame.shape[0] * scale)))
+                        encoded, jpeg = cv2.imencode(".jpg", preview_frame, [cv2.IMWRITE_JPEG_QUALITY, 72])
+                        if encoded:
+                            self._health.preview(self._camera.id, jpeg.tobytes())
                     if frame_number % self._camera.frame_stride:
                         continue
                     for recognition in self._engine.recognize(frame, self._camera.roi):
@@ -83,8 +100,11 @@ class CameraWorker(Thread):
                                 self._image_store.save(event.log_id, confirmed.plate_image, confirmed.vehicle_frame)
                             except Exception:
                                 self._logger.exception("event was committed but its images could not be saved")
+            except ConnectionError as error:
+                self._logger.warning("RTSP interrupted; reconnecting: %s", error)
+                self._health.disconnected(self._camera.id, str(error))
             except Exception as error:
-                self._logger.exception("camera worker failed; reconnecting")
+                self._logger.exception("unexpected camera worker failure; reconnecting")
                 self._health.disconnected(self._camera.id, str(error))
             finally:
                 capture.release()

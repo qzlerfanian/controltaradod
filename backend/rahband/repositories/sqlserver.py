@@ -31,6 +31,7 @@ WHERE [Two] = ? AND [Three] = ? AND [City] = ? AND [Alpha] = ?;
 """
 
     INSERT_EVENT = """
+IF NOT EXISTS (SELECT 1 FROM [IMPDb].[TEL].[tbPlateLogs] WHERE [Id] = ?)
 INSERT INTO [IMPDb].[TEL].[tbPlateLogs]
     ([Id], [Model], [Color], [Fullname], [TransTime], [IO], [CarId], [UserId],
      [Two], [Three], [City], [Alpha], [LogId], [PlateNumber], [PlateString], [CameraIP])
@@ -116,7 +117,7 @@ WHERE [Two] = ? AND [Three] = ? AND [City] = ? AND [Alpha] = ?;
             cursor = connection.cursor()
             cursor.execute(
                 self.INSERT_EVENT,
-                str(event.id), bounded(owner.model, 100) if owner else None,
+                str(event.id), str(event.id), bounded(owner.model, 100) if owner else None,
                 bounded(owner.color, 100) if owner else None,
                 bounded(owner.full_name, 200) if owner else None, event.occurred_at,
                 "ورود" if event.direction.value == "entry" else "خروج",
@@ -144,6 +145,115 @@ WHERE [Two] = ? AND [Three] = ? AND [City] = ? AND [Alpha] = ?;
             }
             for row in rows
         ]
+
+    def paginated_events(
+        self, *, page: int = 1, page_size: int = 25,
+        date_from: Any = None, date_to: Any = None, direction: str | None = None,
+        access: bool | None = None, camera: str | None = None, search: str | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        safe_page = max(1, page)
+        safe_size = max(1, min(page_size, 100))
+        cte, where, params = self._filtered_events_sql(
+            date_from=date_from, date_to=date_to, direction=direction,
+            access=access, camera=camera, search=search,
+        )
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute(f"{cte} SELECT COUNT_BIG(*) FROM Enriched {where};", *params)
+            total = int(cursor.fetchone()[0])
+            cursor.execute(
+                f"""{cte}
+                SELECT [Id],[Model],[Color],[FullName],[TransTime],[IO],[CarId],[Two],[Three],
+                       [City],[Alpha],[LogId],[PlateNumber],[PlateString],[CameraIP],[Access],[Unit]
+                FROM Enriched {where}
+                ORDER BY [TransTime] DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY;""",
+                *params, (safe_page - 1) * safe_size, safe_size,
+            )
+            rows = cursor.fetchall()
+        return [self._event_row(row) for row in rows], total
+
+    def export_events(
+        self, *, date_from: Any = None, date_to: Any = None,
+        direction: str | None = None, access: bool | None = None,
+        camera: str | None = None, search: str | None = None, limit: int = 50000,
+    ) -> list[dict[str, Any]]:
+        cte, where, params = self._filtered_events_sql(
+            date_from=date_from, date_to=date_to, direction=direction,
+            access=access, camera=camera, search=search,
+        )
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""{cte}
+                SELECT TOP (?) [Id],[Model],[Color],[FullName],[TransTime],[IO],[CarId],[Two],[Three],
+                       [City],[Alpha],[LogId],[PlateNumber],[PlateString],[CameraIP],[Access],[Unit]
+                FROM Enriched {where} ORDER BY [TransTime] DESC;""",
+                *params, max(1, min(limit, 50000)),
+            )
+            return [self._event_row(row) for row in cursor.fetchall()]
+
+    @staticmethod
+    def _event_row(row: Any) -> dict[str, Any]:
+        return {
+            "id": str(row[0]), "model": row[1], "color": row[2], "full_name": row[3],
+            "trans_time": row[4], "direction": "entry" if row[5] == "ورود" else "exit",
+            "car_id": row[6], "two": str(row[7] or ""), "three": str(row[8] or ""),
+            "city": str(row[9] or ""), "alpha": row[10], "log_id": str(row[11]),
+            "plate_number": row[12], "plate_string": row[13], "camera_ip": row[14],
+            "access": bool(row[15]), "unit": row[16],
+        }
+
+    @staticmethod
+    def _filtered_events_sql(
+        *, date_from: Any, date_to: Any, direction: str | None,
+        access: bool | None, camera: str | None, search: str | None,
+    ) -> tuple[str, str, list[Any]]:
+        log_clauses: list[str] = []
+        enriched_clauses: list[str] = []
+        params: list[Any] = []
+        if date_from is not None:
+            log_clauses.append("logs.[TransTime] >= ?")
+            params.append(date_from)
+        if date_to is not None:
+            log_clauses.append("logs.[TransTime] < ?")
+            params.append(date_to)
+        if direction:
+            log_clauses.append("logs.[IO] = ?")
+            params.append("ورود" if direction == "entry" else "خروج")
+        if camera:
+            log_clauses.append("RTRIM(logs.[CameraIP]) = ?")
+            params.append(camera)
+        if access is not None:
+            enriched_clauses.append("[Access] = ?")
+            params.append(1 if access else 0)
+        if search:
+            term = f"%{search.strip()}%"
+            enriched_clauses.append(
+                "([PlateNumber] LIKE ? OR [FullName] LIKE ? OR [Unit] LIKE ? OR [Model] LIKE ?)"
+            )
+            params.extend([term, term, term, term])
+        log_where = "WHERE " + " AND ".join(log_clauses) if log_clauses else ""
+        enriched_where = "WHERE " + " AND ".join(enriched_clauses) if enriched_clauses else ""
+        cte = f"""
+WITH FilteredLogs AS (
+    SELECT logs.* FROM [IMPDb].[TEL].[tbPlateLogs] AS logs {log_where}
+), Enriched AS (
+    SELECT logs.[Id], COALESCE(carById.[Model], carByPlate.[Model], logs.[Model]) AS [Model],
+           COALESCE(carById.[Color], carByPlate.[Color], logs.[Color]) AS [Color],
+           COALESCE(carById.[FullName], carByPlate.[FullName], logs.[Fullname]) AS [FullName], logs.[TransTime],
+           logs.[IO], logs.[CarId], logs.[Two], logs.[Three], logs.[City], logs.[Alpha],
+           logs.[LogId], logs.[PlateNumber], logs.[PlateString], logs.[CameraIP],
+           COALESCE(carById.[Access], carByPlate.[Access], 0) AS [Access],
+           COALESCE(carById.[Unit], carByPlate.[Unit]) AS [Unit]
+    FROM FilteredLogs AS logs
+    LEFT JOIN [IMPDb].[CTV].[tbCars] AS carById ON carById.[Id] = logs.[CarId]
+    LEFT JOIN [IMPDb].[CTV].[tbCars] AS carByPlate
+      ON logs.[CarId] IS NULL AND carByPlate.[Two] = logs.[Two]
+     AND carByPlate.[Three] = logs.[Three] AND carByPlate.[City] = logs.[City]
+     AND carByPlate.[Alpha] = logs.[Alpha]
+)
+"""
+        return cte, enriched_where, params
 
     def today_stats(self) -> dict[str, int]:
         with closing(self._connection_factory()) as connection:

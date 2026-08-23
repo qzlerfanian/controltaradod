@@ -18,6 +18,7 @@ class CameraHealth:
 class CameraHealthRegistry:
     def __init__(self, camera_ids: list[str]) -> None:
         self._items = {camera_id: CameraHealth(camera_id) for camera_id in camera_ids}
+        self._previews: dict[str, bytes] = {}
         self._lock = Lock()
 
     def connected(self, camera_id: str) -> None:
@@ -37,6 +38,14 @@ class CameraHealthRegistry:
         with self._lock:
             self._items[camera_id].last_detection_at = datetime.now(timezone.utc)
 
+    def preview(self, camera_id: str, jpeg: bytes) -> None:
+        with self._lock:
+            self._previews[camera_id] = jpeg
+
+    def latest_preview(self, camera_id: str) -> bytes | None:
+        with self._lock:
+            return self._previews.get(camera_id)
+
     def disconnected(self, camera_id: str, error: str) -> None:
         with self._lock:
             item = self._items[camera_id]
@@ -47,4 +56,3 @@ class CameraHealthRegistry:
     def snapshot(self) -> dict[str, dict[str, object]]:
         with self._lock:
             return {camera_id: asdict(item) for camera_id, item in self._items.items()}
-

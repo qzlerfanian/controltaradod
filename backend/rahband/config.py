@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     site_name: str = "راهبند"
     database_connection_string: SecretStr | None = None
     mqtt_host: str = "127.0.0.1"
+    mqtt_enabled: bool = False
     mqtt_port: int = 1883
     mqtt_topic: str = "beenato/plateB2"
     relay_host: str | None = None
@@ -60,6 +61,8 @@ class Settings(BaseSettings):
     shadow_mode: bool = True
     camera_workers_enabled: bool = False
     image_root: str = "../runtime/images"
+    outbox_path: str = "../runtime/outbox.sqlite3"
+    outbox_retry_seconds: float = Field(default=5, ge=1, le=300)
     plate_model_path: str = "../legacy_source/ANPR/best_yolo11n_60_epoch_plate_openvino_model"
     character_model_path: str = "../legacy_source/ANPR/best_s_openvino_model"
     plate_confidence: float = Field(default=0.04, gt=0, le=1)
@@ -68,6 +71,8 @@ class Settings(BaseSettings):
     vote_window_seconds: float = Field(default=1.5, gt=0, le=10)
     vote_min_observations: int = Field(default=2, ge=1, le=10)
     camera_reconnect_seconds: float = Field(default=3, ge=0.2, le=60)
+    camera_open_timeout_ms: int = Field(default=8000, ge=1000, le=60000)
+    camera_read_timeout_ms: int = Field(default=8000, ge=1000, le=60000)
 
     @property
     def cameras(self) -> list[CameraSettings]:
