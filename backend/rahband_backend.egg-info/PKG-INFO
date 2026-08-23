@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: rahband-backend
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: fastapi<1,>=0.110
+Requires-Dist: paho-mqtt<3,>=2
+Requires-Dist: pydantic<3,>=2.6
+Requires-Dist: pydantic-settings<3,>=2.2
+Requires-Dist: pyodbc<6,>=5
+Requires-Dist: PyYAML<7,>=6
+Requires-Dist: uvicorn[standard]<1,>=0.27
+Provides-Extra: test
+Requires-Dist: pytest<9,>=8; extra == "test"
+Provides-Extra: hardware
+Requires-Dist: nrcpy; extra == "hardware"
+Provides-Extra: anpr
+Requires-Dist: opencv-python-headless>=4.9; extra == "anpr"
+Requires-Dist: openvino>=2024; extra == "anpr"
+Requires-Dist: ultralytics>=8.3; extra == "anpr"

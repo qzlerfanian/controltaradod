@@ -1,0 +1,23 @@
+[Unit]
+Description=Rahband React dashboard
+After=network-online.target rahband-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rahband
+Group=rahband
+WorkingDirectory=/opt/rahband/frontend
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+

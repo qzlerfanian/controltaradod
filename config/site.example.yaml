@@ -1,0 +1,42 @@
+site:
+  id: baran-2
+  name: "باران ۲"
+  timezone: Asia/Tehran
+
+cameras:
+  - id: gate-entry-1
+    name: "دوربین ورودی اصلی"
+    direction: entry
+    rtsp_env: CAMERA_GATE_ENTRY_1_RTSP
+    relay_id: main-gate
+    enabled: true
+    roi: {x1: 800, y1: 400, x2: 1800, y2: 900}
+  - id: gate-exit-1
+    name: "دوربین خروجی اصلی"
+    direction: exit
+    rtsp_env: CAMERA_GATE_EXIT_1_RTSP
+    relay_id: main-gate
+    enabled: true
+    roi: {x1: 0, y1: 0, x2: 1920, y2: 1080}
+
+relays:
+  - id: main-gate
+    driver: nrc
+    host_env: RELAY_MAIN_HOST
+    username_env: RELAY_MAIN_USERNAME
+    password_env: RELAY_MAIN_PASSWORD
+    channel: 1
+    hold_seconds: 15
+
+database:
+  url_env: DATABASE_URL
+  owners_table: CTV.tbCars
+  events_table: TEL.tbPlateLogs
+
+recognition:
+  cross_camera_duplicate_window_seconds: 20
+
+mqtt:
+  host_env: MQTT_HOST
+  port: 1883
+  topic: beenato/plateB2
