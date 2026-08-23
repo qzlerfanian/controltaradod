@@ -49,6 +49,8 @@ export const api = {
   events: () => request<ApiEvent[]>("/api/v1/events?limit=20"),
   stats: () => request<TodayStats>("/api/v1/stats/today"),
   owners: () => request<ApiOwner[]>("/api/v1/owners?limit=200"),
+  cameraSnapshotUrl: (cameraId: string, version: number) =>
+    `${base}/api/v1/cameras/${encodeURIComponent(cameraId)}/snapshot?v=${version}`,
   createOwner: (owner: {
     full_name: string; model: string; color: string; unit: string;
     two: string; alpha: string; three: string; city: string; access: boolean;
