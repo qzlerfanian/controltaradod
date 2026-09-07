@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     relay_channel: int = 1
     relay_contact_ms: int = 100
     relay_hold_seconds: int = 15
-    duplicate_window_seconds: int = 20
+    duplicate_window_seconds: int = 60
     cameras_json: str = "[]"
     cameras_override_json: str | None = None
     camera_database_names_json: str = "{}"
@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     camera_workers_enabled: bool = False
     image_root: str = "../runtime/images"
     outbox_path: str = "../runtime/outbox.sqlite3"
+    owner_audit_path: str = "../runtime/owner_audit.sqlite3"
+    auth_database_path: str = "../runtime/auth.sqlite3"
+    auth_session_hours: int = Field(default=12, ge=1, le=720)
+    auth_cookie_secure: bool = False
+    image_retention_days: int = Field(default=60, ge=1, le=3650)
+    image_max_disk_percent: float = Field(default=85, ge=10, le=99)
+    image_cleanup_interval_seconds: float = Field(default=3600, ge=60, le=86400)
+    camera_offline_alert_seconds: int = Field(default=60, ge=10, le=86400)
     outbox_retry_seconds: float = Field(default=5, ge=1, le=300)
     plate_model_path: str = "../legacy_source/ANPR/best_yolo11n_60_epoch_plate_openvino_model"
     character_model_path: str = "../legacy_source/ANPR/best_s_openvino_model"

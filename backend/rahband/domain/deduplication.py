@@ -25,6 +25,10 @@ class PassageDeduplicator:
                 del self._seen[item]
             last_seen = self._seen.get(key)
             if last_seen is not None and current - last_seen < self._window:
+                # Use a sliding quiet window. A plate continuously observed by
+                # overlapping cameras must remain suppressed until it has not
+                # been seen by any camera for the full window.
+                self._seen[key] = current
                 return False
             self._seen[key] = current
             return True
@@ -39,4 +43,3 @@ class PassageDeduplicator:
         if result.tzinfo is None:
             raise ValueError("now must be timezone-aware")
         return result.astimezone(timezone.utc)
-

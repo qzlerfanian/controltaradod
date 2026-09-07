@@ -13,11 +13,16 @@ class CameraHealth:
     last_detection_at: datetime | None = None
     reconnect_count: int = 0
     error: str | None = None
+    disconnected_since: datetime | None = None
 
 
 class CameraHealthRegistry:
     def __init__(self, camera_ids: list[str]) -> None:
-        self._items = {camera_id: CameraHealth(camera_id) for camera_id in camera_ids}
+        started_at = datetime.now(timezone.utc)
+        self._items = {
+            camera_id: CameraHealth(camera_id, disconnected_since=started_at)
+            for camera_id in camera_ids
+        }
         self._previews: dict[str, bytes] = {}
         self._lock = Lock()
 
@@ -26,6 +31,7 @@ class CameraHealthRegistry:
             item = self._items[camera_id]
             item.online = True
             item.error = None
+            item.disconnected_since = None
 
     def frame(self, camera_id: str) -> None:
         with self._lock:
@@ -33,6 +39,7 @@ class CameraHealthRegistry:
             item.online = True
             item.last_frame_at = datetime.now(timezone.utc)
             item.error = None
+            item.disconnected_since = None
 
     def detection(self, camera_id: str) -> None:
         with self._lock:
@@ -52,6 +59,8 @@ class CameraHealthRegistry:
             item.online = False
             item.reconnect_count += 1
             item.error = error[:200]
+            if item.disconnected_since is None:
+                item.disconnected_since = datetime.now(timezone.utc)
 
     def snapshot(self) -> dict[str, dict[str, object]]:
         with self._lock:

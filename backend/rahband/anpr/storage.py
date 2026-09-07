@@ -24,8 +24,15 @@ class ImageStore:
         directory = self.plates if kind == "plate" else self.vehicles if kind == "vehicle" else None
         if directory is None:
             return None
-        path = directory / f"{log_id}.jpg"
-        return path if path.is_file() else None
+        # New images are JPEG/lowercase. PNG and uppercase UUID variants keep
+        # compatibility with images copied from the legacy ANPR application.
+        identifier = str(log_id)
+        for stem in (identifier, identifier.upper()):
+            for extension in (".jpg", ".jpeg", ".png"):
+                path = directory / f"{stem}{extension}"
+                if path.is_file():
+                    return path
+        return None
 
     def _write_jpeg(self, path: Path, image: object) -> None:
         import cv2
@@ -36,4 +43,3 @@ class ImageStore:
         temporary = path.with_suffix(".tmp")
         temporary.write_bytes(encoded.tobytes())
         temporary.replace(path)
-

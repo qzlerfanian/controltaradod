@@ -4,17 +4,20 @@ import asyncio
 import csv
 import io
 import secrets
+import socket
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from rahband.config import CameraSettings, Settings, get_settings
 from rahband.domain.events import PassageDirection
+from rahband.repositories.sqlserver import DuplicateOwnerError
 from rahband.runtime import AppRuntime
 
 
@@ -69,6 +72,15 @@ class OwnerCreateRequest(BaseModel):
     access: bool = True
 
 
+class OwnerAccessRequest(BaseModel):
+    access: bool
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=8, max_length=256)
+
+
 class WebSocketHub:
     def __init__(self) -> None:
         self._clients: set[WebSocket] = set()
@@ -112,7 +124,10 @@ async def lifespan(app: FastAPI):
         runtime.camera_supervisor.start()
     if runtime.outbox_replayer is not None:
         runtime.outbox_replayer.start()
+    runtime.image_retention_worker.start()
     yield
+    runtime.image_retention_worker.stop()
+    runtime.image_retention_worker.join(timeout=5)
     if runtime.outbox_replayer is not None:
         runtime.outbox_replayer.stop()
         runtime.outbox_replayer.join(timeout=10)
@@ -126,12 +141,54 @@ app = FastAPI(title="Rahband API", version="0.2.0", lifespan=lifespan)
 settings_at_import = get_settings()
 app.add_middleware(
     CORSMiddleware, allow_origins=settings_at_import.allowed_origins,
-    allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-Control-Token"],
+    allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "X-Control-Token"],
 )
+
+SESSION_COOKIE = "rahband_session"
+PUBLIC_API_PATHS = {"/api/v1/auth/login", "/api/v1/health"}
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and not path.startswith("/api/v1/internal/"):
+        current: AppRuntime = request.app.state.runtime
+        user = current.auth.user_for_session(request.cookies.get(SESSION_COOKIE))
+        if user is None:
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+        request.state.user = user
+    return await call_next(request)
 
 
 def runtime() -> AppRuntime:
     return app.state.runtime
+
+
+@app.post("/api/v1/auth/login")
+def login(request: LoginRequest, current: Annotated[AppRuntime, Depends(runtime)]) -> Response:
+    authenticated = current.auth.authenticate(request.username, request.password)
+    if authenticated is None:
+        raise HTTPException(status_code=401, detail="invalid username or password")
+    token, user = authenticated
+    response = JSONResponse({"id": user["id"], "username": user["username"], "expires_at": user["expires_at"]})
+    response.set_cookie(
+        SESSION_COOKIE, token, max_age=current.settings.auth_session_hours * 3600,
+        httponly=True, secure=current.settings.auth_cookie_secure, samesite="strict", path="/",
+    )
+    return response
+
+
+@app.get("/api/v1/auth/me")
+def authenticated_user(request: Request) -> dict[str, object]:
+    return request.state.user
+
+
+@app.post("/api/v1/auth/logout", status_code=204)
+def logout(request: Request, current: Annotated[AppRuntime, Depends(runtime)]) -> Response:
+    current.auth.logout(request.cookies.get(SESSION_COOKIE))
+    response = Response(status_code=204)
+    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return response
 
 
 def require_control_token(
@@ -207,8 +264,7 @@ def events(current: Annotated[AppRuntime, Depends(runtime)], limit: Annotated[in
     try:
         items = current.repository.recent_events(limit)
         for item in items:
-            item["plate_image_url"] = f"/api/v1/images/plate/{item['log_id']}"
-            item["vehicle_image_url"] = f"/api/v1/images/vehicle/{item['log_id']}"
+            attach_image_urls(current, item)
         return items
     except Exception as error:
         raise HTTPException(status_code=503, detail="database unavailable") from error
@@ -226,6 +282,21 @@ def passage_filters(
         "camera": camera.strip() if camera else None,
         "search": search.strip()[:100] if search and search.strip() else None,
     }
+
+
+def attach_image_urls(current: AppRuntime, item: dict[str, Any]) -> None:
+    try:
+        log_id = UUID(str(item["log_id"]))
+    except (ValueError, TypeError, KeyError):
+        item["plate_image_url"] = None
+        item["vehicle_image_url"] = None
+        return
+    item["plate_image_url"] = (
+        f"/api/v1/images/plate/{log_id}" if current.image_store.path_for("plate", log_id) else None
+    )
+    item["vehicle_image_url"] = (
+        f"/api/v1/images/vehicle/{log_id}" if current.image_store.path_for("vehicle", log_id) else None
+    )
 
 
 @app.get("/api/v1/passages")
@@ -246,8 +317,7 @@ def passages(
             **passage_filters(date_from, date_to, direction, access, camera, search),
         )
         for item in items:
-            item["plate_image_url"] = f"/api/v1/images/plate/{item['log_id']}"
-            item["vehicle_image_url"] = f"/api/v1/images/vehicle/{item['log_id']}"
+            attach_image_urls(current, item)
         return {
             "items": items, "total": total, "page": page, "page_size": page_size,
             "pages": (total + page_size - 1) // page_size,
@@ -305,9 +375,91 @@ def create_owner(request: OwnerCreateRequest, current: Annotated[AppRuntime, Dep
         raise HTTPException(status_code=503, detail="database is not configured")
     try:
         owner_id = current.repository.create_owner(request.model_dump())
-        return {"id": owner_id, "access": True}
+        owner = current.repository.get_owner(owner_id)
+        current.owner_audit.record(owner_id, "created", actor="admin", after=owner)
+        return owner or {"id": owner_id, "access": request.access}
+    except DuplicateOwnerError as error:
+        raise HTTPException(status_code=409, detail="plate already exists") from error
     except Exception as error:
         raise HTTPException(status_code=503, detail="owner could not be saved") from error
+
+
+@app.patch("/api/v1/owners/{owner_id}")
+def update_owner(owner_id: int, request: OwnerCreateRequest, current: Annotated[AppRuntime, Depends(require_control_token)]) -> dict[str, Any]:
+    if current.repository is None:
+        raise HTTPException(status_code=503, detail="database is not configured")
+    before = current.repository.get_owner(owner_id)
+    if before is None:
+        raise HTTPException(status_code=404, detail="owner not found")
+    try:
+        after = current.repository.update_owner(owner_id, request.model_dump())
+        current.owner_audit.record(owner_id, "updated", actor="admin", before=before, after=after)
+        return after or {}
+    except DuplicateOwnerError as error:
+        raise HTTPException(status_code=409, detail="plate already exists") from error
+
+
+@app.patch("/api/v1/owners/{owner_id}/access")
+def set_owner_access(owner_id: int, request: OwnerAccessRequest, current: Annotated[AppRuntime, Depends(require_control_token)]) -> dict[str, Any]:
+    if current.repository is None:
+        raise HTTPException(status_code=503, detail="database is not configured")
+    before = current.repository.get_owner(owner_id)
+    if before is None:
+        raise HTTPException(status_code=404, detail="owner not found")
+    after = current.repository.set_owner_access(owner_id, request.access)
+    current.owner_audit.record(owner_id, "access_enabled" if request.access else "access_disabled", actor="admin", before=before, after=after)
+    return after or {}
+
+
+@app.delete("/api/v1/owners/{owner_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_owner(owner_id: int, current: Annotated[AppRuntime, Depends(require_control_token)]) -> Response:
+    if current.repository is None:
+        raise HTTPException(status_code=503, detail="database is not configured")
+    before = current.repository.get_owner(owner_id)
+    if before is None:
+        raise HTTPException(status_code=404, detail="owner not found")
+    current.repository.delete_owner(owner_id)
+    current.owner_audit.record(owner_id, "deleted", actor="admin", before=before)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/v1/owners/{owner_id}/history")
+def owner_history(owner_id: int, current: Annotated[AppRuntime, Depends(runtime)]) -> list[dict[str, Any]]:
+    return current.owner_audit.history(owner_id)
+
+
+@app.get("/api/v1/system/status")
+def system_status(current: Annotated[AppRuntime, Depends(runtime)]) -> dict[str, Any]:
+    try:
+        database = bool(current.repository and current.repository.ping())
+    except Exception:
+        database = False
+    relay_reachable = False
+    if current.settings.relay_host:
+        try:
+            with socket.create_connection((current.settings.relay_host, current.settings.relay_port), timeout=1):
+                relay_reachable = True
+        except OSError:
+            pass
+    now = datetime.now(timezone.utc)
+    camera_settings = {camera.id: camera for camera in current.settings.cameras}
+    camera_rows = []
+    for camera_id, health_item in current.camera_health.snapshot().items():
+        disconnected = health_item.get("disconnected_since")
+        offline_seconds = int((now - disconnected).total_seconds()) if isinstance(disconnected, datetime) else 0
+        camera = camera_settings[camera_id]
+        camera_rows.append({
+            **health_item, "name": camera.name, "ip": camera.ip, "direction": camera.direction,
+            "offline_seconds": offline_seconds,
+            "long_disconnect": not health_item["online"] and offline_seconds >= current.settings.camera_offline_alert_seconds,
+            "snapshot_url": f"/api/v1/cameras/{camera_id}/snapshot",
+        })
+    return {
+        "checked_at": now, "database": database, "relay": relay_reachable,
+        "relay_configured": bool(current.settings.relay_host), "cameras": camera_rows,
+        "images": current.image_retention.statistics(), "queued_events": current.outbox.count(),
+        "camera_startup_error": current.camera_startup_error,
+    }
 
 
 @app.get("/api/v1/stats/today")
@@ -347,6 +499,10 @@ async def submit_detection(request: DetectionRequest, current: Annotated[AppRunt
 
 @app.websocket("/api/v1/ws/events")
 async def event_stream(websocket: WebSocket) -> None:
+    current: AppRuntime = websocket.app.state.runtime
+    if current.auth.user_for_session(websocket.cookies.get(SESSION_COOKIE)) is None:
+        await websocket.close(code=4401)
+        return
     await hub.connect(websocket)
     try:
         while True:
@@ -357,8 +513,6 @@ async def event_stream(websocket: WebSocket) -> None:
 
 @app.get("/api/v1/images/{kind}/{log_id}", response_class=FileResponse)
 def event_image(kind: Literal["plate", "vehicle"], log_id: str, current: Annotated[AppRuntime, Depends(runtime)]) -> FileResponse:
-    from uuid import UUID
-
     try:
         parsed_id = UUID(log_id)
     except ValueError as error:

@@ -7,18 +7,16 @@ Wants=network-online.target
 Type=simple
 User=rahband
 Group=rahband
-WorkingDirectory=/opt/rahband/backend
-EnvironmentFile=/etc/rahband/rahband.env
-ExecStart=/opt/rahband/venv/bin/uvicorn rahband.api.main:app --host 127.0.0.1 --port 8000
+WorkingDirectory=/data/projects/rahband/backend
+EnvironmentFile=/data/projects/rahband/backend/.env
+ExecStart=/data/projects/rahband/backend/.venv/bin/uvicorn rahband.api.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=3
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/rahband /var/log/rahband
+ReadWritePaths=/data/projects/rahband/runtime /var/log/rahband
 
 [Install]
 WantedBy=multi-user.target
-

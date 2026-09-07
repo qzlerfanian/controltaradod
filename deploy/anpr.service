@@ -1,0 +1,24 @@
+[Unit]
+Description=Rahband ANPR backend, camera workers and API
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=b3-rahband
+Group=b3-rahband
+WorkingDirectory=/data/projects/rahband/backend
+EnvironmentFile=/data/projects/rahband/backend/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp
+ExecStart=/data/projects/rahband/backend/.venv/bin/uvicorn rahband.api.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

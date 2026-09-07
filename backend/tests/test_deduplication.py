@@ -16,3 +16,13 @@ def test_plate_is_accepted_after_window() -> None:
     assert dedupe.should_accept("29d69112", now=now) is True
     assert dedupe.should_accept("29d69112", now=now + timedelta(seconds=20)) is True
 
+
+def test_continuous_cross_camera_observations_extend_suppression_window() -> None:
+    dedupe = PassageDeduplicator(window_seconds=20)
+    now = datetime(2026, 8, 15, tzinfo=timezone.utc)
+
+    assert dedupe.should_accept("29d69112", now=now) is True
+    assert dedupe.should_accept("29d69112", now=now + timedelta(seconds=15)) is False
+    assert dedupe.should_accept("29d69112", now=now + timedelta(seconds=30)) is False
+    assert dedupe.should_accept("29d69112", now=now + timedelta(seconds=49)) is False
+    assert dedupe.should_accept("29d69112", now=now + timedelta(seconds=69)) is True

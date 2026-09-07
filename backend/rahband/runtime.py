@@ -12,6 +12,9 @@ from rahband.domain.relay import RelayCoordinator
 from rahband.repositories.sqlserver import SqlServerRepository
 from rahband.services.passage import PassageService
 from rahband.services.outbox import OutboxReplayer, SqlitePassageOutbox
+from rahband.services.owner_audit import OwnerAuditStore
+from rahband.services.image_retention import ImageRetentionService, ImageRetentionWorker
+from rahband.services.auth import AuthStore
 from rahband.anpr.health import CameraHealthRegistry
 from rahband.anpr.storage import ImageStore
 from rahband.anpr.worker import CameraSupervisor, CameraWorker
@@ -29,6 +32,10 @@ class AppRuntime:
     camera_supervisor: CameraSupervisor | None
     outbox: SqlitePassageOutbox
     outbox_replayer: OutboxReplayer | None
+    owner_audit: OwnerAuditStore
+    image_retention: ImageRetentionService
+    image_retention_worker: ImageRetentionWorker
+    auth: AuthStore
     camera_startup_error: str | None = None
 
     @classmethod
@@ -48,6 +55,13 @@ class AppRuntime:
         relay = RelayCoordinator(driver, settings.relay_hold_seconds)
         mqtt = MqttPublisher(settings.mqtt_host, settings.mqtt_port, settings.mqtt_topic, settings.site_id)
         image_store = ImageStore(settings.image_root)
+        owner_audit = OwnerAuditStore(settings.owner_audit_path)
+        auth = AuthStore(settings.auth_database_path, settings.auth_session_hours)
+        image_retention = ImageRetentionService(
+            settings.image_root, settings.image_retention_days, settings.image_max_disk_percent,
+            settings.image_cleanup_interval_seconds,
+        )
+        image_retention_worker = ImageRetentionWorker(image_retention)
         outbox = SqlitePassageOutbox(settings.outbox_path)
         enabled_cameras = [camera for camera in settings.cameras if camera.enabled]
         camera_health = CameraHealthRegistry([camera.id for camera in enabled_cameras])
@@ -93,5 +107,6 @@ class AppRuntime:
                     startup_error = str(error)
         return cls(
             settings, repository, relay, mqtt, passage_service, image_store,
-            camera_health, supervisor, outbox, outbox_replayer, startup_error,
+            camera_health, supervisor, outbox, outbox_replayer, owner_audit,
+            image_retention, image_retention_worker, auth, startup_error,
         )

@@ -8,6 +8,10 @@ from rahband.domain.events import OwnerAccess, PassageEvent
 from rahband.domain.plate import Plate
 
 
+class DuplicateOwnerError(ValueError):
+    pass
+
+
 class Cursor(Protocol):
     def execute(self, sql: str, *params: Any) -> Any: ...
     def fetchone(self) -> Any: ...
@@ -88,9 +92,17 @@ OUTPUT INSERTED.[Id]
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?);
 """
 
-    DELETE_OWNER_BY_PLATE = """
-DELETE FROM [IMPDb].[CTV].[tbCars]
-WHERE [Two] = ? AND [Three] = ? AND [City] = ? AND [Alpha] = ?;
+    OWNER_BY_ID = """
+SELECT [Id], [FullName], [Model], [Color], [Two], [Three], [City], [Alpha],
+       [Access], [Unit], [Access_Type], [description], [Time], [User_id]
+FROM [IMPDb].[CTV].[tbCars] WHERE [Id] = ?;
+"""
+
+    UPDATE_OWNER = """
+UPDATE [IMPDb].[CTV].[tbCars]
+SET [FullName]=?, [Model]=?, [Color]=?, [Two]=?, [Three]=?, [City]=?, [Alpha]=?,
+    [Access]=?, [Unit]=?, [Access_Type]=?, [description]=?, [User_id]=?
+WHERE [Id]=?;
 """
 
     def __init__(self, connection_factory: Callable[[], Connection]) -> None:
@@ -283,9 +295,12 @@ WITH FilteredLogs AS (
         with closing(self._connection_factory()) as connection:
             cursor = connection.cursor()
             cursor.execute(
-                self.DELETE_OWNER_BY_PLATE,
+                "SELECT TOP (1) [Id] FROM [IMPDb].[CTV].[tbCars] WITH (UPDLOCK, HOLDLOCK) "
+                "WHERE [Two]=? AND [Three]=? AND [City]=? AND [Alpha]=?",
                 owner["two"], owner["three"], owner["city"], owner["alpha"],
             )
+            if cursor.fetchone() is not None:
+                raise DuplicateOwnerError("plate already exists")
             cursor.execute(
                 self.INSERT_OWNER, owner["full_name"], owner.get("model"), owner.get("color"),
                 owner["two"], owner["three"], owner["city"], owner["alpha"],
@@ -296,6 +311,55 @@ WITH FilteredLogs AS (
             row = cursor.fetchone()
             connection.commit()
         return int(row[0])
+
+    @staticmethod
+    def _owner_row(row: Any) -> dict[str, Any]:
+        return {
+            "id": int(row[0]), "full_name": row[1], "model": row[2], "color": row[3],
+            "two": str(row[4] or ""), "three": str(row[5] or ""), "city": str(row[6] or ""),
+            "alpha": row[7], "access": bool(row[8]), "unit": row[9], "access_type": row[10],
+            "description": row[11], "created_at": row[12], "user_id": row[13],
+        }
+
+    def get_owner(self, owner_id: int) -> dict[str, Any] | None:
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute(self.OWNER_BY_ID, owner_id)
+            row = cursor.fetchone()
+        return self._owner_row(row) if row else None
+
+    def update_owner(self, owner_id: int, owner: dict[str, Any]) -> dict[str, Any] | None:
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "SELECT TOP (1) [Id] FROM [IMPDb].[CTV].[tbCars] WHERE [Two]=? AND [Three]=? AND [City]=? AND [Alpha]=? AND [Id]<>?",
+                owner["two"], owner["three"], owner["city"], owner["alpha"], owner_id,
+            )
+            if cursor.fetchone() is not None:
+                raise DuplicateOwnerError("plate already exists")
+            cursor.execute(
+                self.UPDATE_OWNER, owner["full_name"], owner.get("model"), owner.get("color"),
+                owner["two"], owner["three"], owner["city"], owner["alpha"], bool(owner.get("access", True)),
+                owner.get("unit"), owner.get("access_type", 0), owner.get("description"), owner.get("user_id"), owner_id,
+            )
+            connection.commit()
+        return self.get_owner(owner_id)
+
+    def set_owner_access(self, owner_id: int, access: bool) -> dict[str, Any] | None:
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute("UPDATE [IMPDb].[CTV].[tbCars] SET [Access]=? WHERE [Id]=?", access, owner_id)
+            connection.commit()
+        return self.get_owner(owner_id)
+
+    def delete_owner(self, owner_id: int) -> bool:
+        if self.get_owner(owner_id) is None:
+            return False
+        with closing(self._connection_factory()) as connection:
+            cursor = connection.cursor()
+            cursor.execute("DELETE FROM [IMPDb].[CTV].[tbCars] WHERE [Id]=?", owner_id)
+            connection.commit()
+        return True
 
     def ping(self) -> bool:
         with closing(self._connection_factory()) as connection:

@@ -43,7 +43,10 @@ def main() -> int:
             failures += 1
     db_value = settings.database_connection_string.get_secret_value() if settings.database_connection_string else None
     failures += not tcp("SQL Server", database_host(db_value), 1433)
-    failures += not tcp("MQTT", settings.mqtt_host, settings.mqtt_port)
+    if settings.mqtt_enabled:
+        failures += not tcp("MQTT", settings.mqtt_host, settings.mqtt_port)
+    else:
+        print("[SKIP] MQTT: disabled")
     failures += not tcp("NRC relay", settings.relay_host, settings.relay_port)
     for camera in settings.cameras:
         failures += not tcp(f"camera {camera.id}", camera.ip, 554)
@@ -54,4 +57,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
