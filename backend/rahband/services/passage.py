@@ -46,7 +46,12 @@ class PassageService:
             self._outbox.enqueue(event, error)
             logging.getLogger(__name__).warning("database event queued locally (%s)", error)
         if owner is not None and owner.access and self._relay_enabled:
-            self._relay.authorize(now=now)
+            try:
+                self._relay.authorize(now=now)
+            except Exception as error:
+                logging.getLogger(__name__).warning(
+                    "relay unavailable; database event remains committed (%s)", error
+                )
         if self._mqtt is not None:
             try:
                 self._mqtt.publish(self.serialize(event))

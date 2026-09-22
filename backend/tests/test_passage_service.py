@@ -14,6 +14,11 @@ class FakeRelay:
         self.count += 1
 
 
+class FailingRelay:
+    def trigger(self) -> None:
+        raise TimeoutError("relay offline")
+
+
 class FakeRepository:
     def __init__(self, access: bool) -> None:
         self.owner = OwnerAccess(22, "مالک", "سراتو", "سفید", access, None, 0)
@@ -98,3 +103,16 @@ def test_database_failure_is_queued_and_returns_event() -> None:
     )
     assert result is not None
     assert len(outbox.events) == 1
+
+
+def test_relay_failure_does_not_discard_committed_event() -> None:
+    repository = FakeRepository(access=True)
+    service = PassageService(repository, RelayCoordinator(FailingRelay()), PassageDeduplicator(20))
+
+    event = service.process_detection(
+        plate_value="29d69112", direction=PassageDirection.ENTRY,
+        camera_ip="In_L", occurred_at=datetime(2026, 8, 15, tzinfo=timezone.utc),
+    )
+
+    assert event is not None
+    assert repository.events == [event]

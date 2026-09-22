@@ -26,6 +26,8 @@ class RoiSettings(BaseModel):
     y1: int = Field(ge=0)
     x2: int = Field(gt=0)
     y2: int = Field(gt=0)
+    reference_width: int = Field(default=1920, gt=0)
+    reference_height: int = Field(default=1080, gt=0)
 
     def model_post_init(self, __context: object) -> None:
         if self.x2 <= self.x1 or self.y2 <= self.y1:
@@ -56,11 +58,19 @@ class Settings(BaseSettings):
     cameras_json: str = "[]"
     cameras_override_json: str | None = None
     camera_database_names_json: str = "{}"
+    camera_rois_json: str = "{}"
     cors_origins: str = "http://localhost:3000"
     control_token: SecretStr | None = None
     shadow_mode: bool = True
     camera_workers_enabled: bool = False
     image_root: str = "../runtime/images"
+    image_index_path: str | None = None
+    image_match_window_seconds: float = Field(default=15, ge=1, le=300)
+    database_utc_offset_minutes: int = Field(default=210, ge=-720, le=840)
+    detection_log_enabled: bool = True
+    detection_log_path: str = "../runtime/detections.log"
+    detection_log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
+    detection_log_backup_count: int = Field(default=5, ge=0, le=100)
     outbox_path: str = "../runtime/outbox.sqlite3"
     owner_audit_path: str = "../runtime/owner_audit.sqlite3"
     auth_database_path: str = "../runtime/auth.sqlite3"
@@ -86,9 +96,16 @@ class Settings(BaseSettings):
     def cameras(self) -> list[CameraSettings]:
         value = self.cameras_override_json or self.cameras_json
         database_names = json.loads(self.camera_database_names_json)
+        roi_values = json.loads(self.camera_rois_json)
         cameras = [CameraSettings.model_validate(item) for item in json.loads(value)]
         return [
-            camera.model_copy(update={"database_name": database_names.get(camera.ip, camera.database_name)})
+            camera.model_copy(update={
+                "database_name": database_names.get(camera.ip, camera.database_name),
+                "roi": (
+                    RoiSettings.model_validate(roi_values[camera.ip])
+                    if camera.ip in roi_values else camera.roi
+                ),
+            })
             for camera in cameras
         ]
 

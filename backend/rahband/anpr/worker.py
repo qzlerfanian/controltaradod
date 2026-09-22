@@ -10,6 +10,7 @@ from rahband.services.passage import PassageService
 
 from .health import CameraHealthRegistry
 from .inference import OpenVinoAnprEngine
+from .detection_log import DetectionAuditLog
 from .storage import ImageStore
 from .voting import TemporalPlateVoter
 
@@ -22,6 +23,7 @@ class CameraWorker(Thread):
         passage_service: PassageService,
         image_store: ImageStore,
         health: CameraHealthRegistry,
+        detection_log: DetectionAuditLog,
         *,
         vote_window_seconds: float,
         vote_min_observations: int,
@@ -35,6 +37,7 @@ class CameraWorker(Thread):
         self._passage_service = passage_service
         self._image_store = image_store
         self._health = health
+        self._detection_log = detection_log
         self._voter = TemporalPlateVoter(vote_window_seconds, vote_min_observations)
         self._reconnect_seconds = reconnect_seconds
         self._open_timeout_ms = open_timeout_ms
@@ -80,9 +83,20 @@ class CameraWorker(Thread):
                     if frame_number % self._camera.frame_stride:
                         continue
                     for recognition in self._engine.recognize(frame, self._camera.roi):
+                        self._detection_log.record("observed", self._camera, recognition)
                         confirmed = self._voter.observe(recognition)
                         if confirmed is None:
                             continue
+                        self._detection_log.record("confirmed", self._camera, confirmed)
+                        self._logger.info(
+                            "plate confirmed=%s confidence=%.3f quality=%.3f sharpness=%.3f size=%sx%s",
+                            confirmed.plate.canonical,
+                            confirmed.confidence,
+                            confirmed.image_quality,
+                            confirmed.sharpness,
+                            confirmed.plate_width,
+                            confirmed.plate_height,
+                        )
                         self._health.detection(self._camera.id)
                         try:
                             event = self._passage_service.process_detection(
@@ -97,9 +111,20 @@ class CameraWorker(Thread):
                             continue
                         if event is not None:
                             try:
-                                self._image_store.save(event.log_id, confirmed.plate_image, confirmed.vehicle_frame)
+                                plate_path, vehicle_path = self._image_store.save(
+                                    event,
+                                    confirmed.plate_image,
+                                    confirmed.vehicle_frame,
+                                )
+                                self._logger.info(
+                                    "event images saved log_id=%s plate=%s vehicle=%s",
+                                    event.log_id, plate_path, vehicle_path,
+                                )
                             except Exception:
-                                self._logger.exception("event was committed but its images could not be saved")
+                                self._logger.exception(
+                                    "event was committed but its images could not be saved log_id=%s",
+                                    event.log_id,
+                                )
             except ConnectionError as error:
                 self._logger.warning("RTSP interrupted; reconnecting: %s", error)
                 self._health.disconnected(self._camera.id, str(error))

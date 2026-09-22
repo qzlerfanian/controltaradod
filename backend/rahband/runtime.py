@@ -16,6 +16,7 @@ from rahband.services.owner_audit import OwnerAuditStore
 from rahband.services.image_retention import ImageRetentionService, ImageRetentionWorker
 from rahband.services.auth import AuthStore
 from rahband.anpr.health import CameraHealthRegistry
+from rahband.anpr.detection_log import DetectionAuditLog
 from rahband.anpr.storage import ImageStore
 from rahband.anpr.worker import CameraSupervisor, CameraWorker
 
@@ -28,6 +29,7 @@ class AppRuntime:
     mqtt: MqttPublisher
     passage_service: PassageService | None
     image_store: ImageStore
+    detection_log: DetectionAuditLog
     camera_health: CameraHealthRegistry
     camera_supervisor: CameraSupervisor | None
     outbox: SqlitePassageOutbox
@@ -54,7 +56,17 @@ class AppRuntime:
             driver = DisabledRelay()
         relay = RelayCoordinator(driver, settings.relay_hold_seconds)
         mqtt = MqttPublisher(settings.mqtt_host, settings.mqtt_port, settings.mqtt_topic, settings.site_id)
-        image_store = ImageStore(settings.image_root)
+        image_store = ImageStore(
+            settings.image_root,
+            index_path=settings.image_index_path,
+            database_utc_offset_minutes=settings.database_utc_offset_minutes,
+        )
+        detection_log = DetectionAuditLog(
+            settings.detection_log_path,
+            enabled=settings.detection_log_enabled,
+            max_bytes=settings.detection_log_max_bytes,
+            backup_count=settings.detection_log_backup_count,
+        )
         owner_audit = OwnerAuditStore(settings.owner_audit_path)
         auth = AuthStore(settings.auth_database_path, settings.auth_session_hours)
         image_retention = ImageRetentionService(
@@ -92,7 +104,7 @@ class AppRuntime:
                     )
                     workers = [
                         CameraWorker(
-                            camera, engine, passage_service, image_store, camera_health,
+                            camera, engine, passage_service, image_store, camera_health, detection_log,
                             vote_window_seconds=settings.vote_window_seconds,
                             vote_min_observations=settings.vote_min_observations,
                             reconnect_seconds=settings.camera_reconnect_seconds,
@@ -106,7 +118,7 @@ class AppRuntime:
                     logging.getLogger(__name__).exception("camera subsystem could not start")
                     startup_error = str(error)
         return cls(
-            settings, repository, relay, mqtt, passage_service, image_store,
+            settings, repository, relay, mqtt, passage_service, image_store, detection_log,
             camera_health, supervisor, outbox, outbox_replayer, owner_audit,
             image_retention, image_retention_worker, auth, startup_error,
         )

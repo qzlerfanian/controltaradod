@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -22,6 +23,21 @@ class Recognition:
     confidence: float
     plate_image: Any
     vehicle_frame: Any
+    character_confidences: tuple[float, ...] = ()
+    image_quality: float = 0.0
+    sharpness: float = 0.0
+    plate_width: int = 0
+    plate_height: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CharacterCandidate:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    code: str
+    confidence: float
 
 
 class OpenVinoAnprEngine:
@@ -67,46 +83,157 @@ class OpenVinoAnprEngine:
                     plate_image = self._safe_crop(view, x1, y1, x2, y2)
                     if plate_image.size == 0:
                         continue
-                    plate, char_confidence = self._read_characters(plate_image)
+                    plate, character_scores = self._read_characters(plate_image)
                     if plate is None:
                         continue
+                    char_confidence = sum(character_scores) / len(character_scores)
                     detector_confidence = float(boxes.conf[index])
+                    plate_height, plate_width = plate_image.shape[:2]
+                    sharpness = self._sharpness(plate_image)
+                    image_quality = self._quality_score(plate_width, plate_height, sharpness)
                     recognitions.append(
                         Recognition(
                             plate=plate,
                             confidence=min(detector_confidence, char_confidence),
                             plate_image=plate_image.copy(),
                             vehicle_frame=frame.copy(),
+                            character_confidences=character_scores,
+                            image_quality=image_quality,
+                            sharpness=sharpness,
+                            plate_width=plate_width,
+                            plate_height=plate_height,
                         )
                     )
             return sorted(recognitions, key=lambda item: item.confidence, reverse=True)
 
-    def _read_characters(self, plate_image: Any) -> tuple[Plate | None, float]:
-        results = self._character_model.predict(plate_image, imgsz=320, conf=self._character_confidence, verbose=False)
-        if not results:
-            return None, 0.0
-        boxes = results[0].boxes
-        ordered = sorted(
-            ((float(boxes.xyxy[index][0]), int(boxes.cls[index]), float(boxes.conf[index])) for index in range(len(boxes))),
-            key=lambda value: value[0],
+    def _read_characters(self, plate_image: Any) -> tuple[Plate | None, tuple[float, ...]]:
+        import cv2
+
+        results: list[tuple[Plate, tuple[float, ...]]] = []
+        original = self._read_characters_once(plate_image)
+        if original[0] is not None:
+            results.append(original)  # type: ignore[arg-type]
+            if sum(original[1]) / len(original[1]) >= 0.78:
+                return original
+
+        # Upscaling before OCR preserves thin strokes which commonly separate
+        # 2/3 and 4/5 on compressed RTSP frames.
+        height, width = plate_image.shape[:2]
+        scale = max(2.0, min(3.0, 240.0 / max(width, 1)))
+        upscaled = cv2.resize(
+            plate_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC,
         )
-        characters = [(CHAR_ID_TO_CODE[class_id], confidence) for _, class_id, confidence in ordered if class_id in CHAR_ID_TO_CODE]
-        value = "".join(character for character, _ in characters)
+        for variant in (upscaled, self._enhance_plate(upscaled)):
+            result = self._read_characters_once(variant)
+            if result[0] is not None:
+                results.append(result)  # type: ignore[arg-type]
+        if not results:
+            return None, ()
+        return max(results, key=lambda item: (sum(item[1]) / len(item[1]), min(item[1])))
+
+    def _read_characters_once(self, plate_image: Any) -> tuple[Plate | None, tuple[float, ...]]:
+        results = self._character_model.predict(
+            plate_image, imgsz=320, conf=self._character_confidence, verbose=False,
+        )
+        if not results:
+            return None, ()
+        boxes = results[0].boxes
+        candidates = []
+        for index in range(len(boxes)):
+            class_id = int(boxes.cls[index])
+            if class_id not in CHAR_ID_TO_CODE:
+                continue
+            x1, y1, x2, y2 = (float(value) for value in boxes.xyxy[index].tolist())
+            candidates.append(CharacterCandidate(
+                x1, y1, x2, y2, CHAR_ID_TO_CODE[class_id], float(boxes.conf[index]),
+            ))
+        characters = self._select_plate_characters(self._suppress_overlaps(candidates))
+        if characters is None:
+            return None, ()
+        value = "".join(character.code for character in characters)
         try:
             plate = Plate.from_detection(value)
         except ValueError:
-            return None, 0.0
+            return None, ()
         if plate.alpha_code.isdigit():
-            return None, 0.0
-        confidence = sum(score for _, score in characters) / len(characters)
-        return plate, confidence
+            return None, ()
+        return plate, tuple(character.confidence for character in characters)
+
+    @staticmethod
+    def _suppress_overlaps(candidates: list[CharacterCandidate]) -> list[CharacterCandidate]:
+        kept: list[CharacterCandidate] = []
+        for candidate in sorted(candidates, key=lambda item: item.confidence, reverse=True):
+            if any(OpenVinoAnprEngine._intersection_over_union(candidate, other) >= 0.45 for other in kept):
+                continue
+            kept.append(candidate)
+        return sorted(kept, key=lambda item: (item.x1 + item.x2) / 2)
+
+    @staticmethod
+    def _intersection_over_union(first: CharacterCandidate, second: CharacterCandidate) -> float:
+        width = max(0.0, min(first.x2, second.x2) - max(first.x1, second.x1))
+        height = max(0.0, min(first.y2, second.y2) - max(first.y1, second.y1))
+        intersection = width * height
+        first_area = max(0.0, first.x2 - first.x1) * max(0.0, first.y2 - first.y1)
+        second_area = max(0.0, second.x2 - second.x1) * max(0.0, second.y2 - second.y1)
+        union = first_area + second_area - intersection
+        return intersection / union if union else 0.0
+
+    @staticmethod
+    def _select_plate_characters(candidates: list[CharacterCandidate]) -> tuple[CharacterCandidate, ...] | None:
+        if len(candidates) < 8:
+            return None
+        # Limit pathological detections before trying combinations.
+        pool = sorted(sorted(candidates, key=lambda item: item.confidence, reverse=True)[:14], key=lambda item: item.x1)
+        best: tuple[float, tuple[CharacterCandidate, ...]] | None = None
+        for selected in combinations(pool, 8):
+            if selected[2].code.isdigit() or any(not item.code.isdigit() for index, item in enumerate(selected) if index != 2):
+                continue
+            centers = [(item.x1 + item.x2) / 2 for item in selected]
+            gaps = [right - left for left, right in zip(centers, centers[1:])]
+            if not gaps or min(gaps) <= 0:
+                continue
+            mean_gap = sum(gaps) / len(gaps)
+            irregularity = sum(abs(gap - mean_gap) for gap in gaps) / (len(gaps) * mean_gap)
+            score = sum(item.confidence for item in selected) / 8 - min(irregularity, 2.0) * 0.06
+            if best is None or score > best[0]:
+                best = (score, selected)
+        return best[1] if best else None
+
+    @staticmethod
+    def _enhance_plate(plate_image: Any) -> Any:
+        import cv2
+
+        lab = cv2.cvtColor(plate_image, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        lightness = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(lightness)
+        enhanced = cv2.cvtColor(cv2.merge((lightness, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+        return cv2.addWeighted(enhanced, 1.35, blurred, -0.35, 0)
+
+    @staticmethod
+    def _sharpness(plate_image: Any) -> float:
+        import cv2
+
+        gray = cv2.cvtColor(plate_image, cv2.COLOR_BGR2GRAY)
+        return min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 500.0, 1.0)
+
+    @staticmethod
+    def _quality_score(width: int, height: int, sharpness: float) -> float:
+        resolution = min(width / 220.0, height / 55.0, 1.0)
+        return round(0.65 * sharpness + 0.35 * max(0.0, resolution), 4)
 
     @staticmethod
     def _crop_roi(frame: Any, roi: RoiSettings | None) -> Any:
         if roi is None:
             return frame
         height, width = frame.shape[:2]
-        return frame[max(0, roi.y1):min(height, roi.y2), max(0, roi.x1):min(width, roi.x2)]
+        scale_x = width / roi.reference_width
+        scale_y = height / roi.reference_height
+        x1 = round(roi.x1 * scale_x)
+        y1 = round(roi.y1 * scale_y)
+        x2 = round(roi.x2 * scale_x)
+        y2 = round(roi.y2 * scale_y)
+        return frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
 
     @staticmethod
     def _safe_crop(image: Any, x1: int, y1: int, x2: int, y2: int) -> Any:
@@ -114,4 +241,3 @@ class OpenVinoAnprEngine:
         pad_x = max(2, int((x2 - x1) * 0.04))
         pad_y = max(2, int((y2 - y1) * 0.08))
         return image[max(0, y1 - pad_y):min(height, y2 + pad_y), max(0, x1 - pad_x):min(width, x2 + pad_x)]
-

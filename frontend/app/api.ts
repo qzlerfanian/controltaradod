@@ -84,6 +84,8 @@ export const api = {
   exportPassagesUrl: (filters: Omit<PassageFilters, "page" | "page_size">) =>
     `${base}/api/v1/passages/export?${queryString(filters)}`,
   assetUrl: (path?: string) => path ? `${base}${path}` : "",
+  eventImageUrl: (kind: "plate" | "vehicle", id?: string | null) =>
+    id ? `${base}/api/v1/images/${kind}/${encodeURIComponent(id)}` : "",
   cameraSnapshotUrl: (cameraId: string, version: number) =>
     `${base}/api/v1/cameras/${encodeURIComponent(cameraId)}/snapshot?v=${version}`,
   createOwner: (owner: OwnerInput, token: string) => request<ApiOwner>("/api/v1/owners", {

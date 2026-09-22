@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from rahband.config import CameraSettings, Settings, get_settings
 from rahband.domain.events import PassageDirection
+from rahband.domain.plate import Plate
 from rahband.repositories.sqlserver import DuplicateOwnerError
 from rahband.runtime import AppRuntime
 
@@ -259,15 +260,12 @@ def camera_snapshot(camera_id: str, current: Annotated[AppRuntime, Depends(runti
 
 @app.get("/api/v1/events")
 def events(current: Annotated[AppRuntime, Depends(runtime)], limit: Annotated[int, Query(ge=1, le=200)] = 20) -> list[dict[str, Any]]:
-    if current.repository is None:
-        return []
     try:
-        items = current.repository.recent_events(limit)
-        for item in items:
-            attach_image_urls(current, item)
-        return items
+        # This endpoint is the live Rahband feed. Its plate text and both image
+        # URLs originate from the same confirmed recognition and UUID.
+        return current.image_store.recent_detections(limit)
     except Exception as error:
-        raise HTTPException(status_code=503, detail="database unavailable") from error
+        raise HTTPException(status_code=503, detail="detection feed unavailable") from error
 
 
 def passage_filters(
@@ -285,18 +283,45 @@ def passage_filters(
 
 
 def attach_image_urls(current: AppRuntime, item: dict[str, Any]) -> None:
+    identifiers: list[UUID] = []
+    # New workers name images with LogId. Some legacy versions used the main
+    # tbPlateLogs Id instead, so both identifiers must remain readable.
+    for field in ("log_id", "id"):
+        try:
+            identifier = UUID(str(item[field]))
+        except (ValueError, TypeError, KeyError):
+            continue
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    matched_by_metadata = current.image_store.matching_log_id(
+        plate_number=event_plate_key(item),
+        camera_ip=item.get("camera_ip"),
+        occurred_at=item.get("trans_time"),
+        max_delta_seconds=current.settings.image_match_window_seconds,
+    )
+    if matched_by_metadata is not None and matched_by_metadata not in identifiers:
+        identifiers.append(matched_by_metadata)
+    for kind in ("plate", "vehicle"):
+        matched = next(
+            (identifier for identifier in identifiers if current.image_store.path_for(kind, identifier)),
+            None,
+        )
+        item[f"{kind}_image_url"] = f"/api/v1/images/{kind}/{matched}" if matched else None
+
+
+def event_plate_key(item: dict[str, Any]) -> str | None:
+    # PlateNumber uses different letter names across legacy producers
+    # (for example Sad/Sin/Taxi), while these four database columns are the
+    # stable representation shared by all systems.
     try:
-        log_id = UUID(str(item["log_id"]))
-    except (ValueError, TypeError, KeyError):
-        item["plate_image_url"] = None
-        item["vehicle_image_url"] = None
-        return
-    item["plate_image_url"] = (
-        f"/api/v1/images/plate/{log_id}" if current.image_store.path_for("plate", log_id) else None
-    )
-    item["vehicle_image_url"] = (
-        f"/api/v1/images/vehicle/{log_id}" if current.image_store.path_for("vehicle", log_id) else None
-    )
+        return Plate(
+            str(item["two"] or "").strip().zfill(2),
+            str(item["alpha"] or "").strip(),
+            str(item["three"] or "").strip().zfill(3),
+            str(item["city"] or "").strip().zfill(2),
+        ).canonical
+    except (KeyError, TypeError, ValueError):
+        return item.get("plate_number") or item.get("plate_string")
 
 
 @app.get("/api/v1/passages")
@@ -520,4 +545,9 @@ def event_image(kind: Literal["plate", "vehicle"], log_id: str, current: Annotat
     path = current.image_store.path_for(kind, parsed_id)
     if path is None:
         raise HTTPException(status_code=404, detail="image not found")
-    return FileResponse(path, media_type="image/jpeg")
+    media_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
