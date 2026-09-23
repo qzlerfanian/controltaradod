@@ -41,6 +41,7 @@ class DetectionAuditLog:
             f"plate={recognition.plate.canonical} confidence={recognition.confidence:.3f} "
             f"quality={recognition.image_quality:.3f} sharpness={recognition.sharpness:.3f} "
             f"size={recognition.plate_width}x{recognition.plate_height} "
+            f"bbox={recognition.bbox_x1},{recognition.bbox_y1},{recognition.bbox_x2},{recognition.bbox_y2} "
             f"characters=[{scores}]\n"
         )
         try:

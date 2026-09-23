@@ -28,6 +28,12 @@ class Recognition:
     sharpness: float = 0.0
     plate_width: int = 0
     plate_height: int = 0
+    bbox_x1: int = 0
+    bbox_y1: int = 0
+    bbox_x2: int = 0
+    bbox_y2: int = 0
+    frame_width: int = 0
+    frame_height: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +74,8 @@ class OpenVinoAnprEngine:
         self._lock = Lock()
 
     def recognize(self, frame: Any, roi: RoiSettings | None) -> list[Recognition]:
-        view = self._crop_roi(frame, roi)
+        roi_x1, roi_y1, roi_x2, roi_y2 = self._scaled_roi_bounds(frame, roi)
+        view = frame[roi_y1:roi_y2, roi_x1:roi_x2]
         if view.size == 0:
             return []
         with self._lock:
@@ -102,6 +109,12 @@ class OpenVinoAnprEngine:
                             sharpness=sharpness,
                             plate_width=plate_width,
                             plate_height=plate_height,
+                            bbox_x1=roi_x1 + x1,
+                            bbox_y1=roi_y1 + y1,
+                            bbox_x2=roi_x1 + x2,
+                            bbox_y2=roi_y1 + y2,
+                            frame_width=frame.shape[1],
+                            frame_height=frame.shape[0],
                         )
                     )
             return sorted(recognitions, key=lambda item: item.confidence, reverse=True)
@@ -224,16 +237,21 @@ class OpenVinoAnprEngine:
 
     @staticmethod
     def _crop_roi(frame: Any, roi: RoiSettings | None) -> Any:
-        if roi is None:
-            return frame
+        x1, y1, x2, y2 = OpenVinoAnprEngine._scaled_roi_bounds(frame, roi)
+        return frame[y1:y2, x1:x2]
+
+    @staticmethod
+    def _scaled_roi_bounds(frame: Any, roi: RoiSettings | None) -> tuple[int, int, int, int]:
         height, width = frame.shape[:2]
+        if roi is None:
+            return 0, 0, width, height
         scale_x = width / roi.reference_width
         scale_y = height / roi.reference_height
         x1 = round(roi.x1 * scale_x)
         y1 = round(roi.y1 * scale_y)
         x2 = round(roi.x2 * scale_x)
         y2 = round(roi.y2 * scale_y)
-        return frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+        return max(0, x1), max(0, y1), min(width, x2), min(height, y2)
 
     @staticmethod
     def _safe_crop(image: Any, x1: int, y1: int, x2: int, y2: int) -> Any:

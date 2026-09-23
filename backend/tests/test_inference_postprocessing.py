@@ -1,7 +1,9 @@
 import numpy as np
 
-from rahband.anpr.inference import CharacterCandidate, OpenVinoAnprEngine
+from rahband.anpr.inference import CharacterCandidate, OpenVinoAnprEngine, Recognition
+from rahband.anpr.worker import CameraWorker
 from rahband.config import RoiSettings
+from rahband.domain.plate import Plate
 
 
 def candidate(index: int, code: str, confidence: float = 0.9) -> CharacterCandidate:
@@ -44,3 +46,31 @@ def test_roi_is_scaled_from_reference_resolution_to_stream_resolution() -> None:
     cropped = OpenVinoAnprEngine._crop_roi(frame, roi)
 
     assert cropped.shape[:2] == (267, 400)
+
+
+def test_trigger_zone_accepts_only_plate_center_inside_box() -> None:
+    zone = RoiSettings(x1=700, y1=500, x2=1600, y2=900)
+    inside = Recognition(
+        Plate.from_detection("29d69112"), 0.9, None, None,
+        bbox_x1=700, bbox_y1=500, bbox_x2=900, bbox_y2=600,
+        frame_width=1920, frame_height=1080,
+    )
+    outside = Recognition(
+        Plate.from_detection("29d69112"), 0.9, None, None,
+        bbox_x1=100, bbox_y1=100, bbox_x2=300, bbox_y2=200,
+        frame_width=1920, frame_height=1080,
+    )
+
+    assert CameraWorker._inside_trigger_zone(inside, zone)
+    assert not CameraWorker._inside_trigger_zone(outside, zone)
+
+
+def test_trigger_zone_scales_with_stream_resolution() -> None:
+    zone = RoiSettings(x1=960, y1=540, x2=1800, y2=1000)
+    recognition = Recognition(
+        Plate.from_detection("29d69112"), 0.9, None, None,
+        bbox_x1=640, bbox_y1=360, bbox_x2=800, bbox_y2=450,
+        frame_width=1280, frame_height=720,
+    )
+
+    assert CameraWorker._inside_trigger_zone(recognition, zone)

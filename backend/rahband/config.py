@@ -17,6 +17,7 @@ class CameraSettings(BaseModel):
     relay_id: str = "main-gate"
     enabled: bool = True
     roi: "RoiSettings | None" = None
+    trigger_zone: "RoiSettings | None" = None
     frame_stride: int = Field(default=3, ge=1, le=30)
     database_name: str | None = Field(default=None, min_length=1, max_length=10)
 
@@ -59,6 +60,7 @@ class Settings(BaseSettings):
     cameras_override_json: str | None = None
     camera_database_names_json: str = "{}"
     camera_rois_json: str = "{}"
+    camera_trigger_zones_json: str = "{}"
     cors_origins: str = "http://localhost:3000"
     control_token: SecretStr | None = None
     shadow_mode: bool = True
@@ -97,6 +99,7 @@ class Settings(BaseSettings):
         value = self.cameras_override_json or self.cameras_json
         database_names = json.loads(self.camera_database_names_json)
         roi_values = json.loads(self.camera_rois_json)
+        trigger_values = json.loads(self.camera_trigger_zones_json)
         cameras = [CameraSettings.model_validate(item) for item in json.loads(value)]
         return [
             camera.model_copy(update={
@@ -104,6 +107,10 @@ class Settings(BaseSettings):
                 "roi": (
                     RoiSettings.model_validate(roi_values[camera.ip])
                     if camera.ip in roi_values else camera.roi
+                ),
+                "trigger_zone": (
+                    RoiSettings.model_validate(trigger_values[camera.ip])
+                    if camera.ip in trigger_values else camera.trigger_zone
                 ),
             })
             for camera in cameras

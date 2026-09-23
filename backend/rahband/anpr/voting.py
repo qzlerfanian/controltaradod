@@ -52,6 +52,12 @@ class TemporalPlateVoter:
             sharpness=selected.sharpness,
             plate_width=selected.plate_width,
             plate_height=selected.plate_height,
+            bbox_x1=selected.bbox_x1,
+            bbox_y1=selected.bbox_y1,
+            bbox_x2=selected.bbox_x2,
+            bbox_y2=selected.bbox_y2,
+            frame_width=selected.frame_width,
+            frame_height=selected.frame_height,
         )
 
     @staticmethod
